@@ -1,0 +1,663 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Starry Night Shader</title>
+<style>
+/* Layout: one full-bleed WebGL canvas, small caption over the lower field */
+:root {
+  --bg: #050c26;
+  --fg: #f6efcf;
+  --muted: #c4d2ee;
+  --accent: #ffd35e;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: crosshair;
+}
+.caption {
+  position: absolute;
+  bottom: 12px;
+  left: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  pointer-events: none;
+  text-shadow: 0 1px 8px rgba(3, 8, 28, 0.9);
+}
+.caption h1 {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.caption p {
+  margin: 4px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.fallback[hidden] { display: none; }
+.fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+}
+</style>
+
+<canvas id="c" aria-label="Animated shader recreation of Van Gogh's Starry Night built from individual brush strokes"></canvas>
+<div class="caption">
+  <h1>Starry Night Shader</h1>
+  <p>After Van Gogh, 1889. Move over the sky to stir the strokes.</p>
+</div>
+<div class="fallback" id="fb" hidden>WebGL 2 is not available in this browser.</div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+void main() {
+  vec2 v = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(v * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform vec2 R;
+uniform float T;
+uniform vec2 M;    // pointer in painting units
+uniform float MA;  // pointer strength
+out vec4 O;
+
+const float TAU = 6.2831853;
+const float PA = 1.2642487;   // painting aspect (976 x 772)
+
+float hash(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * .1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float vn(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3. - 2. * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x),
+             mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0., a = .5;
+  for (int i = 0; i < 4; i++) { s += a * vn(p); p = p * 2.03 + 17.; a *= .5; }
+  return s;
+}
+float box(float d, float lim, float s) { return 1. - smoothstep(lim - s, lim + s, d); }
+vec2 rot(vec2 p, float a) {
+  float c = cos(a), s = sin(a);
+  return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+// painting fractions (x across, y up) to scene units where the height is 1
+vec2 P(float fx, float fy) { return vec2(fx * PA, fy); }
+
+// small rounded dab on a rotated grid (used for wall and roof texture)
+float dab(vec2 p, float ang, vec2 fq, out float hc) {
+  p += .010 * (vec2(vn(p * 22.), vn(p * 22. + 7.)) - .5);
+  vec2 g = rot(p, ang) * fq;
+  vec2 id = floor(g), lc = fract(g);
+  hc = hash(id);
+  lc.x += (hash(id + 3.1) - .5) * .3;
+  return box(abs(lc.x - .5), .50, .14) * box(abs(lc.y - .5), .40, .16);
+}
+
+float sdBox2(vec2 p, vec2 c, vec2 hs) { vec2 d = abs(p - c) - hs; return max(d.x, d.y); }
+float sdRoof(vec2 p, float cx, float y0, float hw, float rh) {
+  float dx = abs(p.x - cx);
+  float slope = (p.y - y0 - rh * (1. - dx / hw)) / sqrt(1. + rh * rh / (hw * hw));
+  return max(max(y0 - p.y, dx - hw), slope);
+}
+
+// ---------- flow field that steers the sky strokes ----------
+float bandY(float xf) { return .335 + .26 * pow(smoothstep(.35, 1.05, xf), 1.1); }
+float bandW(float xf) { return .045 + .045 * smoothstep(.4, 1., xf); }
+
+vec2 eddy(vec2 p, vec2 c, float s, float r, float pitch) {
+  vec2 d = p - c;
+  float q = dot(d, d) + r * r;
+  return (vec2(-d.y, d.x) * s - d * abs(s) * pitch) / q;
+}
+
+vec2 flow(vec2 p, float t) {
+  float xf = p.x / PA;
+  vec2 f = vec2(.35, .05 * sin(p.x * 6. + t * .3 + p.y * 3.));
+  float db = p.y - bandY(xf);
+  float dyc = bandY(xf + .01) - bandY(xf - .01);
+  vec2 bd = normalize(vec2(.02 * PA, dyc));
+  f += bd * 1.4 * exp(-pow(db / (bandW(xf) * 2.5), 2.));
+  f += eddy(p, P(.49, .68) + .004 * vec2(sin(t * .31), cos(t * .27)), .16, .065, .55);
+  f += eddy(p, P(.68, .505) + .003 * vec2(cos(t * .35), sin(t * .29)), .10, .04, .5);
+  f += eddy(p, P(.02, .70), -.05, .10, .2);
+  // stars and moon each push a little ring of flow around themselves
+  f += eddy(p, P(.907, .825), .03, .09, .1);
+  f += eddy(p, P(.230, .825), .015, .05, .1);
+  f += eddy(p, P(.604, .916), .015, .05, .1);
+  f += eddy(p, M, .10 * MA, .04, .4);
+  return f / max(length(f), 1e-3);
+}
+
+// ---------- ground silhouettes ----------
+float ridge1(float xf) { return .225 + .03 * smoothstep(.2, .4, xf) + .23 * pow(smoothstep(.35, 1., xf), 1.1); }
+float ridge2(float xf) { return .20 + .19 * smoothstep(.45, 1., xf); }
+
+// ---------- stroke engine ----------
+// Direction each family of strokes follows
+vec2 dirAt(int mode, vec2 p, float t, float h) {
+  if (mode == 0) return flow(p, t);
+  float xf = p.x / PA;
+  if (mode == 1) return normalize(vec2(.02 * PA, ridge1(xf + .01) - ridge1(xf - .01) + (h - .5) * .012));
+  if (mode == 2) return normalize(vec2(.02 * PA, ridge2(xf + .01) - ridge2(xf - .01) + (h - .5) * .012));
+  if (mode == 3) return normalize(vec2(.38 * sin(p.y * 18. + p.x * 25. + t * .4) + (h - .5) * .5, 1.));
+  if (mode == 4) return normalize(vec2(1., .35 * sin(p.x * 11. + p.y * 30.) + (h - .5) * .3));
+  float a = .5 + (h - .5) * 1.8;   // mode 5: loose foliage dabs
+  return vec2(cos(a), sin(a));
+}
+
+// one stroke covering this pixel: coverage, colour id, centre (painting units), local coords
+struct Stk { float m; float hc; vec2 c; vec2 l; };
+
+// Lays one jittered, curved, tapered stroke per grid cell along dirAt().
+// Returns the top two strokes covering the pixel so overlaps composite cleanly.
+void strokes(vec2 p, float sc, int mode, float t, float L, float W, float drift,
+             float keep, float seed, out Stk a, out Stk b) {
+  a = Stk(0., 0., vec2(0.), vec2(0.));
+  b = a;
+  float pa = -1., pb = -1.;
+  vec2 g = p * sc;
+  vec2 cell = floor(g);
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec2 id = cell + vec2(float(i), float(j));
+      vec2 sid = id + seed;
+      if (hash(sid + 5.5) > keep) continue;
+      float h1 = hash(sid), h2 = hash(sid + 7.7), h3 = hash(sid + 19.3);
+      vec2 c = id + .25 + .5 * vec2(h1, h2);
+      vec2 cp = c / sc;
+      vec2 dir = dirAt(mode, cp, t, h3);
+      vec2 nrm = vec2(-dir.y, dir.x);
+      vec2 d = g - c - dir * drift * sin(t * .7 + h1 * TAU);
+      float u = dot(d, dir), v = dot(d, nrm);
+      float hl = L * (.75 + .5 * h3);
+      float hw = W * (.8 + .4 * h2);
+      v -= (h1 - .5) * .6 * u * u / hl;                       // bowed stroke
+      float k = abs(u) / hl;
+      hw *= (1. - .45 * smoothstep(.35, 1., k))                // tapered ends
+          * (1. + .25 * (vn(vec2(u * 2.5, h1 * 50.)) - .5));   // ragged edge
+      float m = box(abs(u), hl, .1) * box(abs(v), hw, .06);
+      if (m <= .001) continue;
+      Stk s = Stk(m, hash(sid + 11.1), cp, vec2(u / hl, v / max(hw, 1e-3)));
+      float pr = hash(sid + 3.3);
+      if (pr > pa) { b = a; pb = pa; a = s; pa = pr; }
+      else if (pr > pb) { b = s; pb = pr; }
+    }
+  }
+}
+
+float bristle(Stk s) { return vn(vec2(s.l.x * 2.2, s.l.y * 6. + s.hc * 61.)); }
+// paint ridge across the stroke plus bristle grooves
+float relief(Stk s) { float y = clamp(s.l.y, -1., 1.); return (1. - y * y) * .55 + bristle(s) * .45; }
+vec3 strokeTex(vec3 c, Stk s) {
+  float b = bristle(s);
+  return c * (.84 + .3 * b) * (1. - .14 * smoothstep(.55, 1., abs(s.l.y)));
+}
+
+// ---------- sky ----------
+vec3 skyPal(float v) {
+  v = clamp(v, 0., 1.) * 5.;
+  vec3 c0 = vec3(.015, .03, .16), c1 = vec3(.05, .11, .42), c2 = vec3(.12, .28, .74);
+  vec3 c3 = vec3(.32, .56, .90), c4 = vec3(.74, .88, .95), c5 = vec3(1., 1., .90);
+  if (v < 1.) return mix(c0, c1, v);
+  if (v < 2.) return mix(c1, c2, v - 1.);
+  if (v < 3.) return mix(c2, c3, v - 2.);
+  if (v < 4.) return mix(c3, c4, v - 3.);
+  return mix(c4, c5, v - 4.);
+}
+
+// brightness of the sky at p: the two spirals and the long luminous band
+float skyV(vec2 p, float t, float n, out float band) {
+  float xf = p.x / PA;
+  vec2 dA = p - P(.49, .68);
+  float rA = length(dA) + 1e-4;
+  float armA = .5 + .5 * cos(7. * atan(dA.y, dA.x) + 12.7 * log(rA) - t * .4);
+  float hiA = exp(-pow(rA / .26, 2.)) * mix(.15, 1., smoothstep(.35, .65, armA)) * (.45 + .55 * n);
+  hiA = max(hiA, .9 * exp(-pow(rA / .035, 2.)));
+
+  vec2 dB = p - P(.68, .505);
+  float rB = length(dB) + 1e-4;
+  float armB = .5 + .5 * cos(4. * atan(dB.y, dB.x) + 8. * log(rB) - t * .5);
+  float hiB = exp(-pow(rB / .15, 2.)) * mix(.15, 1., smoothstep(.35, .65, armB)) * (.5 + .5 * n);
+  hiB = max(hiB, .95 * exp(-pow(rB / .025, 2.)));
+
+  float db = p.y - bandY(xf);
+  band = exp(-pow(db / (bandW(xf) * 1.2), 2.)) * (.5 + .5 * n) * smoothstep(.28, .40, xf);
+
+  float hi = max(max(hiA, hiB), band);
+  float v = .14 + .32 * n + .65 * hi;
+  return v * mix(.62, 1., smoothstep(.05, .22, n));
+}
+
+// each sky stroke takes one flat colour from where its centre sits
+vec3 skyStrokeCol(Stk s, float t) {
+  float n = clamp(.5 + (s.hc - .5) * .8 + (fbm(s.c * 7. + 3.) - .5) * .7, 0., 1.);
+  float band;
+  float v = skyV(s.c, t, n, band);
+  v += (hash(s.c * 91.) - .5) * .14 * (1. - band);
+  v += s.l.x * .03;
+  vec3 c = skyPal(v);
+  c = mix(c, vec3(.95, .86, .45), step(.8, s.hc) * band * .75);   // yellow streaks in the band
+  return strokeTex(c, s);
+}
+
+// sparse contrasting dashes laid over the base strokes
+vec3 accentCol(Stk s, float t) {
+  float band;
+  float v = skyV(s.c, t, .5 + (s.hc - .5) * .6, band);
+  float k = hash(s.c * 53.);
+  vec3 c;
+  if (v > .62)      c = mix(vec3(1., .94, .66), vec3(.97, .99, .92), k);
+  else if (v > .40) c = mix(vec3(.52, .78, .92), vec3(.82, .93, .90), k);
+  else              c = mix(vec3(.04, .09, .38), vec3(.17, .37, .50), k);
+  return strokeTex(c, s);
+}
+
+// ---------- stars and moon: dashes on concentric rings ----------
+const vec4 ST[11] = vec4[11](
+  vec4(.100, .950, .054, .55), vec4(.225, .968, .032, .80), vec4(.343, .950, .045, .90),
+  vec4(.412, .932, .032, .90), vec4(.230, .825, .049, .90), vec4(.323, .665, .032, .20),
+  vec4(.353, .462, .080, .35), vec4(.125, .514, .039, .70), vec4(.039, .540, .028, .10),
+  vec4(.604, .916, .054, .90), vec4(.710, .767, .049, .60)
+);
+
+vec4 starAt(vec2 p, vec2 c, float rad, float warm, float kind, float t, out float hcOut) {
+  vec2 d = p - c;
+  float r0 = length(d) / rad;
+  hcOut = .5;
+  if (r0 > 1.5) return vec4(0.);
+  float ang = atan(d.y, d.x);
+  float rr = r0 * 7. + (vn(d / rad * 2.5 + rad * 40.) - .5) * .9;   // wavy rings
+  rr = max(rr, 0.);
+  float ri = floor(rr), ly = fract(rr);
+  float seg = max(5., floor(2.3 * (ri + .5)));
+  float hr = hash(vec2(ri, rad * 100.));
+  float spin = hr * TAU + t * (hr - .5) * .5;
+  float tt = (ang + spin) / TAU * seg;
+  float ci = floor(tt);
+  float lx = fract(tt) + (vn(vec2(tt * 3., ri + rad * 50.)) - .5) * .25;
+  float hc = hash(vec2(mod(ci, seg), ri + rad * 100.));
+  float shape = box(abs(lx - .5), .46, .1) * box(abs(ly - .5), .40, .12);
+  float core = 1. - smoothstep(.12, .2, r0);
+  shape = max(shape, core);
+  hcOut = shape * .7 + hc * .3;
+  float rc = (ri + .5) / 7.;
+  vec3 col;
+  if (kind > .5) {
+    col = mix(vec3(1., .86, .34), vec3(.97, .96, .78), smoothstep(.45, 1., rc));
+    col = mix(col, vec3(.6, .78, .9), smoothstep(1., 1.4, rc));
+  } else {
+    vec3 coreC = mix(vec3(1., .97, .82), vec3(.95, .50, .10), warm);
+    vec3 c1 = mix(vec3(1., .96, .70), vec3(1., .80, .25), warm);
+    vec3 c2 = mix(vec3(.97, .98, .92), vec3(1., .93, .62), warm);
+    col = mix(coreC, c1, smoothstep(.2, .3, rc));
+    col = mix(col, c2, smoothstep(.45, .6, rc));
+    col = mix(col, vec3(.78, .90, .95), smoothstep(.8, .95, rc));
+    col = mix(col, vec3(.45, .65, .88), smoothstep(1.1, 1.3, rc));
+  }
+  col *= .9 + .18 * hc;
+  col *= mix(.86 + .24 * vn(vec2(lx * 4. + ri * 3., ly * 5. + ci)), 1., core);   // bristles
+  vec3 gap = mix(col * .72, vec3(.10, .20, .45), .25);
+  col = mix(gap, col, shape);
+  float a = 1. - smoothstep(1., 1.45, r0 + (hc - .5) * .22);
+  a *= (r0 < 1.) ? 1. : (.25 + .75 * shape);
+  return vec4(col, a);
+}
+
+// ---------- ground ----------
+vec3 hill1Col(Stk s) {
+  vec3 c = mix(vec3(.05, .10, .38), vec3(.13, .23, .56), s.hc);
+  c = mix(c, vec3(.26, .40, .70), step(.9, s.hc));
+  c = mix(c, vec3(.10, .26, .36), step(s.hc, .07));
+  c *= .7 + .3 * smoothstep(.1, .35, s.c.y);
+  return strokeTex(c, s);
+}
+vec3 hill2Col(Stk s) {
+  vec3 c = mix(vec3(.12, .32, .78), vec3(.45, .72, .95), s.hc * s.hc);
+  c = mix(c, vec3(.06, .16, .52), step(s.hc, .15));
+  c *= .6 + .4 * smoothstep(.1, .25, s.c.y);
+  return strokeTex(c, s);
+}
+vec3 foliageCol(Stk s) {
+  vec3 c = mix(vec3(.05, .13, .25), vec3(.16, .36, .42), s.hc);
+  c = mix(c, vec3(.50, .55, .28), step(.92, s.hc) * .8);
+  c = mix(c, vec3(.03, .07, .16), step(s.hc, .12));
+  return strokeTex(c, s);
+}
+vec3 fieldCol(Stk s) {
+  vec3 c = mix(vec3(.06, .12, .27), vec3(.18, .30, .50), s.hc);
+  c = mix(c, vec3(.14, .30, .26), step(.82, s.hc) * .8);
+  c = mix(c, vec3(.55, .48, .22), step(.96, s.hc) * .7);
+  return strokeTex(c, s);
+}
+vec3 cypCol(Stk s, float inside) {
+  vec3 c = mix(vec3(.03, .06, .035), vec3(.11, .17, .09), s.hc);
+  c = mix(c, vec3(.45, .28, .10), step(.78, s.hc) * .8);
+  c = mix(c, vec3(.16, .30, .22), step(s.hc, .08));
+  c = mix(c, vec3(.38, .22, .08), (1. - inside) * .65);
+  return strokeTex(c, s);
+}
+
+// one cottage: walls, pitched roof, lit windows, dark outline
+void house(inout vec3 col, inout float h, vec2 p, float cx, float base, float hw, float hh, float k, float lit) {
+  float rh = hw * (.7 + .6 * fract(k * 7.3));
+  float top = base + hh;
+  float sb = sdBox2(p, vec2(cx, base + hh * .5), vec2(hw, hh * .5));
+  float sr = sdRoof(p, cx, top, hw * 1.18, rh);
+  float sd = min(sb, sr);
+  if (sd > .004) return;
+  float m = 1. - smoothstep(-.0006, .0012, sd);
+  float hc, hr;
+  float ws = dab(p, 1.45, vec2(260., 90.), hc);
+  float rs = dab(p, .6 * sign(p.x - cx), vec2(240., 120.), hr);
+  vec3 wall = mix(vec3(.16, .22, .40), vec3(.46, .48, .56), k);
+  wall = mix(wall, vec3(.62, .55, .32), step(.82, k) * .7);
+  wall *= .8 + .32 * mix(.5, hc, ws);
+  vec3 roof = mix(vec3(.42, .19, .10), vec3(.16, .24, .50), step(.5, fract(k * 3.7)));
+  roof *= .78 + .36 * mix(.5, hr, rs);
+  float onRoof = step(sr, sb);
+  vec3 c = mix(wall, roof, onRoof);
+  float sw = sdBox2(vec2(abs(p.x - cx), p.y), vec2(hw * .45, base + hh * .5), vec2(hw * .2, min(hh * .18, .006)));
+  float wm = (1. - smoothstep(-.0005, .0008, sw)) * lit * (1. - onRoof);
+  c += vec3(.9, .55, .15) * exp(-max(sw, 0.) * 300.) * lit * .3 * (1. - onRoof);
+  c = mix(c, vec3(.99, .72, .24), wm);
+  float edge = smoothstep(-.0035, -.0012, sd);
+  c = mix(c, vec3(.03, .05, .14), edge * .85);
+  col = mix(col, c, m);
+  h = mix(h, .35 + .35 * mix(hc, hr, onRoof) - edge * .3, m);
+}
+
+void church(inout vec3 col, inout float h, vec2 p) {
+  float sBody  = sdBox2(p, P(.55, .175), vec2(.042 * PA, .03));
+  float sRoof  = sdRoof(p, .55 * PA, .205, .052 * PA, .045);
+  float sTower = sdBox2(p, P(.575, .222), vec2(.013 * PA, .022));
+  float sSpire = sdRoof(p, .575 * PA, .243, .012 * PA, .115);
+  float sd = min(min(sBody, sRoof), min(sTower, sSpire));
+  if (sd > .004) return;
+  float m = 1. - smoothstep(-.0006, .0012, sd);
+  float hc;
+  float s = dab(p, 1.5, vec2(220., 80.), hc);
+  float v = mix(.5, hc, s);
+  vec3 c = mix(vec3(.20, .28, .50), vec3(.32, .42, .64), v);
+  if (sRoof < 0. && sTower > 0.) c = mix(vec3(.60, .72, .90), vec3(.84, .91, .98), v);
+  if (sTower < 0.) c = mix(vec3(.38, .48, .74), vec3(.50, .60, .84), v);
+  if (sSpire < 0. && sTower > 0.) c = mix(vec3(.70, .82, .96), vec3(.92, .96, 1.), v);
+  float win = min(step(abs(p.x - .525 * PA), .006) * step(abs(p.y - .17), .012)
+            + step(abs(p.x - .57 * PA), .006) * step(abs(p.y - .165), .012), 1.);
+  c = mix(c, vec3(.98, .68, .22), win * step(sBody, 0.));
+  float edge = smoothstep(-.0035, -.0012, sd);
+  c = mix(c, vec3(.03, .05, .14), edge * .85);
+  col = mix(col, c, m);
+  h = mix(h, .3 + .4 * v - edge * .3, m);
+}
+
+float flameD(vec2 p, float cx, float top, float hw0, float ex, float wob, float t) {
+  float y = p.y;
+  float hw = hw0 * PA * pow(clamp(1. - y / top, 0., 1.), ex)
+           * (1. + .16 * sin(y * 32. + wob) + .10 * sin(y * 83. + wob * 2.));
+  float x0 = cx * PA + .012 * sin(y * 9. + wob) + .004 * sin(t * .7 + y * 6. + wob);
+  return max(abs(p.x - x0) - hw, y - top);
+}
+
+vec4 cypress(vec2 p, float t, out float h) {
+  float sd = flameD(p, .19, .94, .085, .5, 0., t);
+  sd = min(sd, flameD(p, .285, .40, .060, .6, 1.7, t));
+  sd = min(sd, flameD(p, .395, .20, .045, .6, 3.1, t));
+  sd = min(sd, flameD(p, .280, .18, .170, .8, 2.2, t));
+  // smaller tongues licking out of the main column
+  sd = min(sd, flameD(p, .150, .70, .030, .7, 4.0, t));
+  sd = min(sd, flameD(p, .232, .72, .028, .7, 5.3, t));
+  sd = min(sd, flameD(p, .135, .45, .050, .6, 6.1, t));
+  sd = min(sd, flameD(p, .340, .30, .040, .6, 7.4, t));
+  h = 0.;
+  float cover = 1. - smoothstep(-.001, .003, sd);
+  if (cover <= 0.) return vec4(0.);
+  float inside = smoothstep(0., .014, -sd);
+  Stk a, b;
+  strokes(p, 80., 3, t, 1., .3, .05, 2., 41., a, b);
+  vec3 c = vec3(.012, .02, .015);
+  c = mix(mix(c, cypCol(b, inside), b.m), cypCol(a, inside), a.m);
+  c = mix(c, vec3(.015, .02, .012), (1. - smoothstep(0., .003, -sd)) * .8);   // dark contour
+  h = mix(mix(.1, relief(b), b.m), relief(a), a.m);
+  return vec4(c, cover);
+}
+
+void main() {
+  float a = R.x / R.y;
+  float zoom = min(1., a / PA);
+  vec2 q = (gl_FragCoord.xy - .5 * R) / R.y;
+  vec2 pp = q / zoom + vec2(.5 * PA, .5);
+  float t = T;
+  float xf = pp.x / PA;
+  Stk sa, sb;
+
+  // ----- sky: dark under-painting, flow-aligned strokes, sparse contrast dashes -----
+  float band;
+  float vPx = skyV(pp, t, fbm(pp * 5. + 2.), band);
+  vec3 col = skyPal(vPx - .12) * .5;
+  float h = .1;
+
+  strokes(pp, 50., 0, t, 1., .34, .12, 2., 0., sa, sb);
+  col = mix(mix(col, skyStrokeCol(sb, t), sb.m), skyStrokeCol(sa, t), sa.m);
+  h = mix(mix(h, relief(sb), sb.m), relief(sa), sa.m);
+
+  strokes(pp, 105., 0, t, .9, .22, .08, .4, 77., sa, sb);
+  col = mix(mix(col, accentCol(sb, t), sb.m * .9), accentCol(sa, t), sa.m * .9);
+  h = mix(mix(h, relief(sb), sb.m * .9), relief(sa), sa.m * .9);
+
+  // ----- stars -----
+  for (int i = 0; i < 11; i++) {
+    vec4 s = ST[i];
+    float hc;
+    vec4 sc = starAt(pp, P(s.x, s.y), s.z, s.w, 0., t, hc);
+    col = mix(col, sc.rgb, sc.a);
+    h = mix(h, hc, sc.a * .8);
+  }
+
+  // ----- moon -----
+  vec2 mc = P(.907, .825);
+  float mhc;
+  vec4 mo = starAt(pp, mc, .125, 1., 1., t, mhc);
+  col = mix(col, mo.rgb, mo.a);
+  h = mix(h, mhc, mo.a * .8);
+  float cr = max(length(pp - mc) - .071, -(length(pp - mc - vec2(-.032, .030)) - .058));
+  float cm = 1. - smoothstep(-.002, .003, cr);
+  col = mix(col, mix(vec3(.88, .40, .05), vec3(1., .66, .16), mhc), cm);
+
+  // ----- hills: strokes run along each ridge -----
+  float r1 = ridge1(xf), r2 = ridge2(xf);
+  if (pp.y < r1 + .006) {
+    float m = 1. - smoothstep(r1 - .003, r1 + .003, pp.y);
+    strokes(pp, 70., 1, t, 1., .3, 0., 2., 13., sa, sb);
+    vec3 hcol = vec3(.01, .02, .10);
+    hcol = mix(mix(hcol, hill1Col(sb), sb.m), hill1Col(sa), sa.m);
+    hcol = mix(hcol, vec3(.005, .01, .04), (1. - smoothstep(0., .008, r1 - pp.y)) * .9);
+    col = mix(col, hcol, m);
+    h = mix(h, mix(mix(.1, relief(sb), sb.m), relief(sa), sa.m), m);
+  }
+  if (pp.y < r2 + .006) {
+    float m = 1. - smoothstep(r2 - .003, r2 + .003, pp.y);
+    strokes(pp, 75., 2, t, 1., .3, 0., 2., 29., sa, sb);
+    vec3 c2 = vec3(.03, .08, .28);
+    c2 = mix(mix(c2, hill2Col(sb), sb.m), hill2Col(sa), sa.m);
+    c2 = mix(c2, vec3(.02, .05, .18), (1. - smoothstep(0., .005, r2 - pp.y)) * .8);
+    col = mix(col, c2, m);
+    h = mix(h, mix(mix(.1, relief(sb), sb.m), relief(sa), sa.m), m);
+  }
+
+  // ----- trees around the village -----
+  if (pp.y < .27 && xf > .33) {
+    float fol = fbm(vec2(xf * 16., pp.y * 26.) + 3.);
+    float top = .215 + .035 * sin(xf * 11. + 1.) + (fol - .5) * .09;
+    float fm = (1. - smoothstep(-.008, .008, pp.y - top)) * smoothstep(.34, .42, xf) * step(.1, pp.y);
+    if (fm > 0.) {
+      strokes(pp, 120., 5, t, 1., .4, 0., 2., 53., sa, sb);
+      vec3 fc = vec3(.02, .05, .12);
+      fc = mix(mix(fc, foliageCol(sb), sb.m), foliageCol(sa), sa.m);
+      col = mix(col, fc, fm);
+      h = mix(h, mix(mix(.1, relief(sb), sb.m), relief(sa), sa.m), fm);
+    }
+  }
+
+  // ----- olive dabs, lower left -----
+  float hc;
+  float ol = smoothstep(.16, .08, xf) * (1. - smoothstep(.07, .13, pp.y));
+  float os = dab(pp, .3, vec2(50., 50.), hc);
+  col = mix(col, mix(vec3(.55, .45, .12), vec3(.85, .75, .30), hc), ol * os * .7);
+
+  // ----- village: church behind, two rows of cottages -----
+  if (pp.y < .37 && xf > .33) {
+    church(col, h, pp);
+    for (int i = 0; i < 16; i++) {
+      float fi = float(i);
+      bool back = i < 7;
+      float x = back ? .43 + fi * .075 : .37 + (fi - 7.) * .068;
+      x += (hash(vec2(fi, 1.7)) - .5) * .025;
+      if (back && abs(x - .56) < .04) continue;
+      float base = back ? .118 + .03 * smoothstep(.6, 1., x) : .092;
+      float hw = (back ? .011 : .015) + .009 * hash(vec2(fi, 2.3));
+      float hh = (back ? .016 : .022) + .022 * hash(vec2(fi, 3.9));
+      house(col, h, pp, x * PA, base, hw * PA, hh, hash(vec2(fi, 9.1)), step(.35, hash(vec2(fi, 5.1))));
+    }
+  }
+
+  // ----- foreground field -----
+  float fgTop = .10 + .012 * sin(xf * 28.);
+  if (pp.y < fgTop + .008) {
+    float fg = 1. - smoothstep(-.006, .006, pp.y - fgTop);
+    strokes(pp, 85., 4, t, 1., .3, 0., 2., 61., sa, sb);
+    vec3 fc = vec3(.02, .05, .12);
+    fc = mix(mix(fc, fieldCol(sb), sb.m), fieldCol(sa), sa.m);
+    col = mix(col, fc, fg);
+    h = mix(h, mix(mix(.1, relief(sb), sb.m), relief(sa), sa.m), fg);
+  }
+
+  // ----- cypress -----
+  if (xf < .62 && pp.y < .95) {
+    float cyh;
+    vec4 cy = cypress(pp, t, cyh);
+    col = mix(col, cy.rgb, cy.a);
+    h = mix(h, cyh, cy.a);
+  }
+
+  // impasto relief, canvas weave, vignette
+  vec3 n = normalize(vec3(-dFdx(h) * 3.5, -dFdy(h) * 3.5, 1.));
+  float diff = dot(n, normalize(vec3(-.4, .6, .7)));
+  col *= .82 + .3 * diff;
+  col *= .97 + .03 * sin(gl_FragCoord.x * 1.9) * sin(gl_FragCoord.y * 1.9);
+  vec2 vq = gl_FragCoord.xy / R - .5;
+  col *= 1. - .4 * dot(vq, vq);
+  O = vec4(col, 1.);
+}
+</script>
+
+<script>
+(function () {
+  var PA = 976 / 772;
+  var canvas = document.getElementById('c');
+  var gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+  if (!gl) { document.getElementById('fb').hidden = false; return; }
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src.replace(/^\s+/, ''));
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+  var prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    document.getElementById('fb').hidden = false;
+    return;
+  }
+  gl.useProgram(prog);
+  var uR = gl.getUniformLocation(prog, 'R');
+  var uT = gl.getUniformLocation(prog, 'T');
+  var uM = gl.getUniformLocation(prog, 'M');
+  var uMA = gl.getUniformLocation(prog, 'MA');
+
+  var mx = 10, my = 10, target = 0, ma = 0;
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function resize() {
+    var cw = canvas.clientWidth || 1, ch = canvas.clientHeight || 1;
+    var scale = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(1.8e6 / (cw * ch)));
+    canvas.width = Math.max(1, Math.round(cw * scale));
+    canvas.height = Math.max(1, Math.round(ch * scale));
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  function draw(t) {
+    gl.uniform2f(uR, canvas.width, canvas.height);
+    gl.uniform1f(uT, t);
+    gl.uniform2f(uM, mx, my);
+    gl.uniform1f(uMA, ma);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // pointer position in the shader's painting units
+  function pointer(e) {
+    var r = canvas.getBoundingClientRect();
+    var a = r.width / r.height;
+    var zoom = Math.min(1, a / PA);
+    var qx = (e.clientX - r.left) / r.height - 0.5 * a;
+    var qy = 0.5 - (e.clientY - r.top) / r.height;
+    mx = qx / zoom + 0.5 * PA;
+    my = qy / zoom + 0.5;
+    target = 1;
+    if (reduce) draw(12);
+  }
+  canvas.addEventListener('pointermove', pointer);
+  canvas.addEventListener('pointerdown', pointer);
+  canvas.addEventListener('pointerleave', function () { target = 0; });
+  canvas.addEventListener('pointerup', function (e) { if (e.pointerType !== 'mouse') target = 0; });
+
+  window.addEventListener('resize', function () { resize(); if (reduce) draw(12); });
+  resize();
+
+  if (reduce) {
+    draw(12);
+  } else {
+    var start = performance.now();
+    (function frame(now) {
+      ma += (target - ma) * 0.08;
+      draw((now - start) / 1000 + 12);
+      requestAnimationFrame(frame);
+    })(start);
+  }
+})();
+</script>
+
+</body></html>
